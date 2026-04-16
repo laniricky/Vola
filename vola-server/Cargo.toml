@@ -1,0 +1,38 @@
+[package]
+name = "vola-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# Web Framework & WebSockets
+axum = { version = "0.7", features = ["ws", "multipart"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging / Tracing
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Database & Authentication
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite", "uuid", "chrono"] }
+dotenvy = "0.15"
+uuid = { version = "1.8", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+jsonwebtoken = "9.3"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Pub/Sub Fan-out (Redis-equivalent in-process broadcast)
+dashmap = "5.5"
+
+# Image processing (BlurHash generation)
+image = "0.25"
+blurhash = "0.2"
+
+# Security
+sha2 = "0.10"
