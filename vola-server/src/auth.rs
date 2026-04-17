@@ -45,6 +45,7 @@ pub struct UserProfile {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub bio: Option<String>,
+    pub last_seen: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -182,7 +183,7 @@ pub async fn get_user_profile(
     use sqlx::Row;
 
     let row = sqlx::query(
-        "SELECT id, username, display_name, avatar_url, bio FROM users WHERE id = ?"
+        "SELECT id, username, display_name, avatar_url, bio, last_seen FROM users WHERE id = ?"
     )
     .bind(&user_id)
     .fetch_optional(&state.db)
@@ -196,6 +197,7 @@ pub async fn get_user_profile(
             display_name: rec.get("display_name"),
             avatar_url: rec.get("avatar_url"),
             bio: rec.get("bio"),
+            last_seen: rec.get("last_seen"),
         })),
         None => Err(StatusCode::NOT_FOUND),
     }
@@ -231,7 +233,7 @@ pub async fn update_my_profile(
     }
 
     // Return updated profile
-    let row = sqlx::query("SELECT id, username, display_name, avatar_url, bio FROM users WHERE id = ?")
+    let row = sqlx::query("SELECT id, username, display_name, avatar_url, bio, last_seen FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_one(&state.db)
         .await
@@ -243,6 +245,7 @@ pub async fn update_my_profile(
         display_name: row.get("display_name"),
         avatar_url: row.get("avatar_url"),
         bio: row.get("bio"),
+        last_seen: row.get("last_seen"),
     }))
 }
 

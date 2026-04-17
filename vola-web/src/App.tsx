@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Briefcase, Gamepad2, User, Send, Mic, Paperclip, MoreVertical, Search, Check, Image as ImageIcon, LogOut, Plus, Users } from 'lucide-react';
+import { Briefcase, Gamepad2, User, Send, Mic, MicOff, Paperclip, MoreVertical, Search, Check, Image as ImageIcon, LogOut, Plus, Users, Phone, Video, VideoOff, CornerUpLeft, Edit2, Trash2, Smile, X } from 'lucide-react';
 import { Blurhash } from 'react-blurhash';
 import './index.css';
 import { useVola } from './engine/useVola';
+import { useWebRTC } from './engine/useWebRTC';
 
 function ImageBubble({ content }: { content: string }) {
   let hash = content;
@@ -120,6 +121,65 @@ function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (token: string, userId: 
   );
 }
 
+function ProfileModal({ 
+  userId, 
+  onClose, 
+  onUpdate, 
+  onUploadAvatar,
+  currentName,
+  currentBio,
+  currentAvatar
+}: { 
+  userId: string, 
+  onClose: () => void, 
+  onUpdate: (data: { display_name?: string, bio?: string }) => void,
+  onUploadAvatar: (f: File) => void,
+  currentName?: string | null,
+  currentBio?: string | null,
+  currentAvatar?: string | null
+}) {
+  const [name, setName] = useState(currentName || '');
+  const [bio, setBio] = useState(currentBio || '');
+
+  return (
+    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10000 }}>
+      <div style={{ width: 400, backgroundColor: '#1e293b', borderRadius: 16, padding: 24, position: 'relative', boxShadow: '0 10px 40px rgba(0,0,0,0.5)' }}>
+        <X size={20} style={{ position: 'absolute', top: 16, right: 16, cursor: 'pointer', color: '#94a3b8' }} onClick={onClose} />
+        <h2 style={{ marginTop: 0, marginBottom: 20 }}>Edit Profile</h2>
+        
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 24 }}>
+           <div style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: '#334155', backgroundImage: currentAvatar ? `url(${currentAvatar})` : 'none', backgroundSize: 'cover', backgroundPosition: 'center', marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
+              {!currentAvatar && <User size={40} color="#64748b" />}
+           </div>
+           <label style={{ cursor: 'pointer', color: 'var(--accent-color)', fontSize: 14, fontWeight: 500 }}>
+             Change Avatar
+             <input type="file" accept="image/*" style={{ display: 'none' }} onChange={e => {
+               if (e.target.files && e.target.files[0]) onUploadAvatar(e.target.files[0]);
+             }} />
+           </label>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div>
+            <label style={{ display: 'block', marginBottom: 8, fontSize: 13, color: '#94a3b8' }}>Display Name</label>
+            <input type="text" value={name} onChange={e => setName(e.target.value)} style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid #334155', backgroundColor: '#0f172a', color: '#fff', boxSizing: 'border-box' }} />
+          </div>
+          <div>
+            <label style={{ display: 'block', marginBottom: 8, fontSize: 13, color: '#94a3b8' }}>Bio</label>
+            <textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} style={{ width: '100%', padding: '10px 14px', borderRadius: 8, border: '1px solid #334155', backgroundColor: '#0f172a', color: '#fff', boxSizing: 'border-box', resize: 'none' }} />
+          </div>
+          <button 
+            onClick={() => { onUpdate({ display_name: name, bio }); onClose(); }}
+            style={{ marginTop: 12, padding: 12, borderRadius: 8, backgroundColor: 'var(--accent-color)', color: '#fff', fontWeight: 'bold', border: 'none', cursor: 'pointer' }}
+          >
+            Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [activePersona, setActivePersona] = useState('work');
   const [inputText, setInputText] = useState('');
@@ -128,6 +188,10 @@ export default function App() {
   const [showMembers, setShowMembers] = useState(true);
   const [members, setMembers] = useState<any[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  const [replyingTo, setReplyingTo] = useState<any>(null);
+  const [editingMessage, setEditingMessage] = useState<any>(null);
+  const [showProfile, setShowProfile] = useState(false);
 
   const {
     userId,
@@ -154,7 +218,38 @@ export default function App() {
     hasMoreMessages,
     isLoadingMore,
     roomLastMessages,
+    onlineUsers,
+    incomingSignal,
+    sendSignal,
+    editMessage,
+    deleteMessage,
+    addReaction,
+    removeReaction,
+    userProfiles,
+    fetchProfile,
+    updateProfile,
+    uploadAvatar,
   } = useVola();
+
+  const {
+    callState,
+    remoteUserId,
+    isVideo,
+    isMuted,
+    isVideoOff,
+    localVideoRef,
+    remoteVideoRef,
+    remoteAudioRef,
+    startCall,
+    acceptCall,
+    rejectCall,
+    endCall,
+    toggleMute,
+    toggleVideo,
+  } = useWebRTC(userId, incomingSignal, sendSignal);
+
+  const isDM = activeRoomId?.startsWith('dm_');
+  const targetUserIdForCall = isDM ? members.find(m => m.id !== userId)?.id : null;
 
   useEffect(() => {
     if (activeRoomId) {
@@ -166,12 +261,36 @@ export default function App() {
           const seeds: Record<string, string> = {};
           data.forEach((m: any) => {
             if (m.last_read_message_id) seeds[m.id] = m.last_read_message_id;
+            if (m.id && !userProfiles[m.id]) fetchProfile(m.id);
           });
           setReadReceipts(seeds);
         })
         .catch(console.error);
     }
   }, [activeRoomId]);
+
+  useEffect(() => {
+    if (Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // Trigger desktop notification when window is blurred and new message arrives
+  const prevMessagesLength = useRef(messages.length);
+  useEffect(() => {
+    if (messages.length > prevMessagesLength.current) {
+      const latestMessage = messages[messages.length - 1];
+      if (latestMessage.sender_id !== (userId || 'me') && !document.hasFocus()) {
+        const sender = members.find(m => m.id === latestMessage.sender_id);
+        const name = sender ? (sender.display_name || sender.username) : 'Someone';
+        const body = latestMessage.msg_type === 'ImageBlurHash' ? '📷 Sent an image' : latestMessage.content;
+        if (Notification.permission === 'granted') {
+          new Notification(`Vola: ${name}`, { body });
+        }
+      }
+    }
+    prevMessagesLength.current = messages.length;
+  }, [messages, members, userId]);
 
   // Auto-fire markRead when newest message scrolls into view
   const lastMsgRef = useRef<HTMLDivElement>(null);
@@ -215,7 +334,13 @@ export default function App() {
   }, [messages]);
 
   const handleSendText = () => {
-    sendMessage(inputText, 'Text');
+    if (editingMessage) {
+      editMessage(editingMessage.id, inputText);
+      setEditingMessage(null);
+    } else {
+      sendMessage(inputText, 'Text', replyingTo?.id);
+      if (replyingTo) setReplyingTo(null);
+    }
     setInputText('');
     stopTyping();
   };
@@ -231,8 +356,28 @@ export default function App() {
 
   return (
     <div className="app-container">
+      {showProfile && userId && (
+        <ProfileModal 
+          userId={userId} 
+          onClose={() => setShowProfile(false)} 
+          onUpdate={updateProfile}
+          onUploadAvatar={uploadAvatar}
+          currentName={userProfiles[userId]?.display_name}
+          currentBio={userProfiles[userId]?.bio}
+          currentAvatar={userProfiles[userId]?.avatar_url}
+        />
+      )}
+      
       <div className="sidebar-personas">
-        <div style={{ width: 44, height: 44, borderRadius: 22, background: 'var(--accent-gradient)', marginBottom: 20 }}></div>
+        <div 
+           onClick={() => setShowProfile(true)}
+           style={{ 
+             width: 44, height: 44, borderRadius: 22, marginBottom: 20, cursor: 'pointer',
+             background: userProfiles[userId || '']?.avatar_url ? `url(${userProfiles[userId || '']?.avatar_url})` : 'var(--accent-gradient)',
+             backgroundSize: 'cover', backgroundPosition: 'center', border: '2px solid transparent'
+           }}
+           title="Edit Profile"
+        ></div>
         
         <div className={`persona-icon ${activePersona === 'work' ? 'active' : ''}`} onClick={() => setActivePersona('work')}>
           <Briefcase size={22} />
@@ -303,12 +448,18 @@ export default function App() {
             <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
               {typingUsers.length > 0 
                 ? <span style={{ color: 'var(--accent-color)', fontStyle: 'italic', animation: 'pulse 1.5s infinite' }}>{typingUsers.length > 1 ? 'Several people are typing...' : 'Someone is typing...'}</span> 
-                : socketStatus === 'Connected' ? '🟢 Online — Live broadcast active' 
+                : socketStatus === 'Connected' ? (isDM && targetUserIdForCall ? (onlineUsers[targetUserIdForCall] ? '🟢 Online' : (userProfiles[targetUserIdForCall]?.last_seen ? `Offline — Last seen ${new Date(userProfiles[targetUserIdForCall].last_seen! * 1000).toLocaleString()}` : '🔴 Offline')) : '🟢 Online — Live broadcast active')
                 : socketStatus === 'Reconnecting' ? '🟡 Reconnecting...' 
                 : '🔴 Disconnected'}
             </span>
           </div>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 20, color: 'var(--text-secondary)' }}>
+            {isDM && targetUserIdForCall && (
+               <>
+                 <Phone size={20} cursor="pointer" onClick={() => startCall(targetUserIdForCall, false)} color="var(--accent-color)" title="Audio Call" />
+                 <Video size={20} cursor="pointer" onClick={() => startCall(targetUserIdForCall, true)} color="var(--accent-color)" title="Video Call" />
+               </>
+            )}
             <Search size={20} cursor="pointer" />
             <Users size={20} cursor="pointer" onClick={() => setShowMembers(!showMembers)} color={showMembers ? 'var(--accent-color)' : 'var(--text-secondary)'} />
             <MoreVertical size={20} cursor="pointer" />
@@ -339,14 +490,36 @@ export default function App() {
             });
             const isLastMsg = idx === messages.length - 1;
             return (
-              <div key={msg.id} className={`message ${isMe ? 'sent' : 'received'}`} ref={isLastMsg ? lastMsgRef : undefined}>
-                {msg.msg_type === 'ImageBlurHash' ? (
-                  <ImageBubble content={msg.content} />
-                ) : (
-                  msg.content
+              <div key={msg.id} className={`message ${isMe ? 'sent' : 'received'}`} ref={isLastMsg ? lastMsgRef : undefined} style={{ display: 'flex', flexDirection: 'column', position: 'relative' }}>
+                {msg.reply_to_message_id && (
+                  <div className="reply-preview-bubble" style={{ fontSize: 11, opacity: 0.7, padding: '4px 8px', background: 'rgba(0,0,0,0.2)', borderRadius: 6, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <CornerUpLeft size={12} />
+                    {messages.find(m => m.id === msg.reply_to_message_id)?.content || 'Deleted message'}
+                  </div>
                 )}
-                
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div>
+                    {msg.msg_type === 'ImageBlurHash' ? (
+                      <ImageBubble content={msg.content} />
+                    ) : (
+                      <span className={msg.msg_type === 'System' ? 'system-msg' : ''}>{msg.content}</span>
+                    )}
+                  </div>
+                  {/* Actions Tray */}
+                  <div className="msg-actions" style={{ display: 'flex', gap: 6, opacity: 0.6 }}>
+                     <Smile size={14} cursor="pointer" onClick={() => addReaction(msg.id, '👍')} />
+                     <CornerUpLeft size={14} cursor="pointer" onClick={() => { setEditingMessage(null); setReplyingTo(msg); }} />
+                     {isMe && msg.msg_type !== 'System' && (
+                       <>
+                         <Edit2 size={14} cursor="pointer" onClick={() => { setReplyingTo(null); setEditingMessage(msg); setInputText(msg.content); }} />
+                         <Trash2 size={14} cursor="pointer" onClick={() => deleteMessage(msg.id)} color="#ef4444" />
+                       </>
+                     )}
+                  </div>
+                </div>
+
                 <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.7)', marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
+                  {msg.is_edited && <span style={{ fontStyle: 'italic', marginRight: 4 }}>(edited)</span>}
                   {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   {isMe && (
                     <span style={{ display: 'flex', color: isRead ? 'var(--accent-color)' : 'rgba(255,255,255,0.5)' }}>
@@ -355,14 +528,46 @@ export default function App() {
                     </span>
                   )}
                 </div>
+
+                {/* Reactions */}
+                {msg.reactions && Object.keys(msg.reactions).length > 0 && (
+                  <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
+                    {Object.entries(msg.reactions).map(([emoji, users]) => {
+                      const isReacted = Array.isArray(users) && users.includes(userId || 'me');
+                      return (
+                        <div 
+                          key={emoji} 
+                          onClick={() => {
+                            if (isReacted) removeReaction(msg.id, emoji);
+                            else addReaction(msg.id, emoji);
+                          }}
+                          style={{ fontSize: 12, background: isReacted ? 'rgba(59, 130, 246, 0.2)' : 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: 12, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', border: isReacted ? '1px solid var(--accent-color)' : '1px solid transparent' }}
+                        >
+                          {emoji} <span style={{ opacity: 0.7 }}>{(users as string[]).length}</span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
               </div>
             );
           })}
           <div ref={messagesEndRef} />
         </div>
 
-        <div className="chat-input-area">
-          <Paperclip size={22} color="var(--text-secondary)" cursor="pointer" />
+        <div className="chat-input-wrapper" style={{ position: 'relative' }}>
+          {(replyingTo || editingMessage) && (
+            <div style={{ position: 'absolute', top: -40, left: 0, right: 0, height: 40, background: '#1e293b', borderTopLeftRadius: 10, borderTopRightRadius: 10, padding: '0 16px', display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, borderBottom: '1px solid #334155' }}>
+              {replyingTo ? <CornerUpLeft size={14} color="var(--accent-color)" /> : <Edit2 size={14} color="var(--accent-color)" />}
+              <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', opacity: 0.8 }}>
+                 {replyingTo ? 'Replying to: ' : 'Editing: '} 
+                 <span style={{ fontStyle: 'italic' }}>{(replyingTo || editingMessage).content}</span>
+              </span>
+              <X size={16} cursor="pointer" onClick={() => { setReplyingTo(null); setEditingMessage(null); setInputText(''); }} opacity={0.6} />
+            </div>
+          )}
+          <div className="chat-input-area" style={{ borderTopLeftRadius: (replyingTo || editingMessage) ? 0 : 10, borderTopRightRadius: (replyingTo || editingMessage) ? 0 : 10 }}>
+            <Paperclip size={22} color="var(--text-secondary)" cursor="pointer" />
           <input 
             type="file" 
             id="file-upload" 
@@ -394,13 +599,16 @@ export default function App() {
             <Mic size={22} color="var(--text-secondary)" cursor="pointer" />
           )}
         </div>
+        </div>
       </div>
 
       {showMembers && (
         <div style={{ width: 260, backgroundColor: '#0f172a', borderLeft: '1px solid #1e293b', display: 'flex', flexDirection: 'column' }}>
           <div style={{ padding: 20, borderBottom: '1px solid #1e293b', fontWeight: 'bold' }}>Room Members</div>
           <div style={{ flex: 1, padding: 10, overflowY: 'auto' }}>
-            {members.map(m => (
+            {members.map(m => {
+              const isOnline = onlineUsers[m.id] === true;
+              return (
               <div 
                 key={m.id} 
                 style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 10, borderRadius: 8, cursor: m.id === userId ? 'default' : 'pointer', opacity: m.id === userId ? 0.6 : 1 }} 
@@ -409,15 +617,21 @@ export default function App() {
                   if (m.id !== userId) createDM(m.id);
                 }}
               >
-                <div style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#334155', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  {m.display_name?.charAt(0) || m.username.charAt(0)}
+                <div style={{ 
+                  position: 'relative', width: 36, height: 36, borderRadius: 18, backgroundColor: '#334155', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  backgroundImage: userProfiles[m.id]?.avatar_url ? `url(${userProfiles[m.id]?.avatar_url})` : 'none',
+                  backgroundSize: 'cover', backgroundPosition: 'center', overflow: 'hidden'
+                }}>
+                  {!userProfiles[m.id]?.avatar_url && (m.display_name?.charAt(0) || m.username.charAt(0))}
+                  {isOnline && <div style={{ position: 'absolute', bottom: 0, right: 0, width: 10, height: 10, borderRadius: 5, backgroundColor: '#22c55e', border: '2px solid #0f172a', zIndex: 2 }}></div>}
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 500 }}>{m.display_name || m.username} {m.id === userId && '(You)'}</div>
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>@{m.username}</div>
+                  <div style={{ fontSize: 14, fontWeight: 500 }}>{userProfiles[m.id]?.display_name || m.display_name || m.username} {m.id === userId && '(You)'}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>@{m.username} {userProfiles[m.id]?.bio ? `• ${userProfiles[m.id].bio}` : ''}</div>
                 </div>
               </div>
-            ))}
+            );
+            })}
             {members.length === 0 && <div style={{ padding: 10, color: 'var(--text-secondary)', fontSize: 13 }}>No active members mapping found.</div>}
           </div>
         </div>
@@ -451,6 +665,56 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {callState !== 'idle' && (
+         <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.9)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+           {isVideo && (
+              <>
+                 <video ref={remoteVideoRef} autoPlay playsInline style={{ position: 'absolute', width: '100%', height: '100%', objectFit: 'cover', zIndex: -1 }} />
+                 <video ref={localVideoRef} autoPlay playsInline muted style={{ position: 'absolute', bottom: 20, right: 20, width: 120, height: 160, backgroundColor: '#000', objectFit: 'cover', borderRadius: 12, border: '2px solid rgba(255,255,255,0.2)', zIndex: 1 }} />
+              </>
+           )}
+           
+           {(!isVideo || callState !== 'connected') && (
+             <>
+               <div style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: '#334155', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, color: '#fff', marginBottom: 20 }}>
+                 {remoteUserId ? remoteUserId.charAt(0).toUpperCase() : '?'}
+               </div>
+               <h2 style={{ color: '#fff', marginBottom: 10 }}>
+                 {callState === 'calling' ? 'Calling...' : callState === 'ringing' ? (isVideo ? 'Incoming Video Call' : 'Incoming Audio Call') : 'Call Connected'}
+               </h2>
+               {remoteUserId && <div style={{ color: '#aaa', marginBottom: 40 }}>User: {remoteUserId}</div>}
+             </>
+           )}
+
+           <div style={{ display: 'flex', gap: 20, position: 'absolute', bottom: 60, zIndex: 2 }}>
+             {callState === 'ringing' && (
+                <button onClick={acceptCall} style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: '#22c55e', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                   <Phone size={24} color="#fff" />
+                </button>
+             )}
+             
+             {callState === 'connected' && (
+               <>
+                 <button onClick={toggleMute} style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: isMuted ? '#ef4444' : 'rgba(255,255,255,0.2)', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(10px)' }}>
+                    {isMuted ? <MicOff size={24} color="#fff" /> : <Mic size={24} color="#fff" />}
+                 </button>
+                 {isVideo && (
+                    <button onClick={toggleVideo} style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: isVideoOff ? '#ef4444' : 'rgba(255,255,255,0.2)', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(10px)' }}>
+                       {isVideoOff ? <VideoOff size={24} color="#fff" /> : <Video size={24} color="#fff" />}
+                    </button>
+                 )}
+               </>
+             )}
+             
+             <button onClick={callState === 'ringing' ? rejectCall : endCall} style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: '#ef4444', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Phone size={24} color="#fff" style={{ transform: 'rotate(135deg)' }} />
+             </button>
+           </div>
+           
+           {!isVideo && <audio ref={remoteAudioRef} autoPlay />}
+         </div>
       )}
     </div>
   );

@@ -23,6 +23,7 @@ pub async fn init_db() -> DbPool {
             avatar_url TEXT,
             bio TEXT,
             passkey_id TEXT,
+            last_seen INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -41,8 +42,22 @@ pub async fn init_db() -> DbPool {
             content TEXT NOT NULL,
             msg_type TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
+            reply_to_message_id TEXT,
+            is_edited BOOLEAN DEFAULT 0,
+            is_deleted BOOLEAN DEFAULT 0,
             FOREIGN KEY(sender_id) REFERENCES users(id)
         );
+        
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            message_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (message_id, user_id, emoji),
+            FOREIGN KEY(message_id) REFERENCES messages(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
         CREATE TABLE IF NOT EXISTS chat_rooms (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -70,10 +85,11 @@ pub async fn init_db() -> DbPool {
         .expect("Failed to initialize database schema");
 
     // Add column if missing (simple migration for existing dev instances)
-    sqlx::query("ALTER TABLE user_rooms ADD COLUMN last_read_message_id TEXT")
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query("ALTER TABLE user_rooms ADD COLUMN last_read_message_id TEXT").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE messages ADD COLUMN is_edited BOOLEAN DEFAULT 0").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE messages ADD COLUMN is_deleted BOOLEAN DEFAULT 0").execute(&pool).await.ok();
+    sqlx::query("ALTER TABLE users ADD COLUMN last_seen INTEGER").execute(&pool).await.ok();
 
     info!("Database initialized and tables verified");
     pool

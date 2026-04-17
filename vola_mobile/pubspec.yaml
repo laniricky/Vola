@@ -39,6 +39,9 @@ dependencies:
   shared_preferences: ^2.5.5
   flutter_blurhash: ^0.9.1
   image_picker: ^1.0.7
+  flutter_local_notifications: any
+  flutter_webrtc: any
+  permission_handler: any
 
 dev_dependencies:
   flutter_test:

@@ -28,6 +28,7 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 pub struct AppState {
     pub db: db::DbPool,
     pub pubsub: PubSub,
+    pub active_users: Arc<tokio::sync::RwLock<std::collections::HashMap<String, usize>>>,
 }
 
 #[tokio::main]
@@ -40,6 +41,7 @@ async fn main() {
     let shared_state = Arc::new(AppState {
         db: db_pool,
         pubsub: PubSub::new(),
+        active_users: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     tokio::fs::create_dir_all("uploads").await.unwrap();
@@ -58,6 +60,7 @@ async fn main() {
         .route("/api/rooms", post(create_room))
         .route("/api/rooms/:room_id/members", get(get_room_members))
         .route("/api/rooms/dm", post(create_dm))
+        .route("/api/users/online", get(get_online_users))
         .route("/ws", get(ws_handler))
         .with_state(shared_state)
         .layer(CorsLayer::permissive());
@@ -117,6 +120,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
+    // Increment active users and broadcast presence if transitioning 0 -> 1
+    {
+        let mut active = state.active_users.write().await;
+        let count = active.entry(auth_user_id.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            state.pubsub.publish("__global__", WsEvent::PresenceUpdate {
+                user_id: auth_user_id.clone(),
+                is_online: true,
+            });
+        }
+    }
+
     // ─── STEP 2: Spawn ONE broadcast forwarder task ───────────────────────────
     // All room subscriptions feed into this single mpsc channel, which the
     // forwarder drains and pushes to the WebSocket sender. No more N spawns.
@@ -137,6 +153,35 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // Keep JoinHandles so we can abort room listeners on disconnect
     let mut room_listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // Always subscribe to the global channel for presence & notifications
+    let mut global_rx = state.pubsub.subscribe("__global__");
+    let fwd_tx_global = forward_tx.clone();
+    let global_handle = tokio::spawn(async move {
+        loop {
+            match global_rx.recv().await {
+                Ok(event) => { let _ = fwd_tx_global.send(event); }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    room_listener_handles.push(global_handle);
+
+    // Subscribe to personal user channel for direct signaling (e.g. WebRTC)
+    let user_channel_id = format!("user_{}", auth_user_id);
+    let mut user_rx = state.pubsub.subscribe(&user_channel_id);
+    let fwd_tx_user = forward_tx.clone();
+    let user_handle = tokio::spawn(async move {
+        loop {
+            match user_rx.recv().await {
+                Ok(event) => { let _ = fwd_tx_user.send(event); }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    room_listener_handles.push(user_handle);
+
     // ─── STEP 3: Process incoming messages ────────────────────────────────────
     while let Some(Ok(message)) = ws_receiver.next().await {
         match message {
@@ -144,11 +189,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 match serde_json::from_str::<WsEvent>(&text) {
                     Ok(WsEvent::SendMessage(chat_msg)) => {
                         // Persist to SQLite with REAL msg_type
+                        // Persist to SQLite with REAL msg_type
                         let msg_type_str = chat_msg.msg_type.to_string();
                         let _ = sqlx::query(
                             "INSERT OR IGNORE INTO messages \
-                             (id, sender_id, chat_room_id, content, msg_type, timestamp) \
-                             VALUES (?, ?, ?, ?, ?, ?)",
+                             (id, sender_id, chat_room_id, content, msg_type, timestamp, reply_to_message_id) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?)",
                         )
                         .bind(&chat_msg.id)
                         .bind(&chat_msg.sender_id)
@@ -156,6 +202,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         .bind(&chat_msg.content)
                         .bind(&msg_type_str)
                         .bind(chat_msg.timestamp)
+                        .bind(&chat_msg.reply_to_message_id)
                         .execute(&state.db)
                         .await;
 
@@ -244,6 +291,75 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         state.pubsub.publish(&chat_room_id, read_event);
                     }
 
+                    Ok(WsEvent::WebRtcSignal {
+                        target_user_id,
+                        signal_payload,
+                        ..
+                    }) => {
+                        let fwd_event = WsEvent::WebRtcSignal {
+                            sender_user_id: Some(auth_user_id.clone()),
+                            target_user_id: target_user_id.clone(),
+                            signal_payload,
+                        };
+                        let target_channel = format!("user_{}", target_user_id);
+                        state.pubsub.publish(&target_channel, fwd_event);
+                    }
+
+                    Ok(WsEvent::EditMessage { message_id, new_content }) => {
+                        let _ = sqlx::query("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ? AND sender_id = ?")
+                            .bind(&new_content)
+                            .bind(&message_id)
+                            .bind(&auth_user_id)
+                            .execute(&state.db).await;
+                        
+                        let room_id = match sqlx::query_scalar::<_, String>("SELECT chat_room_id FROM messages WHERE id = ?").bind(&message_id).fetch_optional(&state.db).await {
+                            Ok(Some(r)) => r,
+                            _ => continue,
+                        };
+                        state.pubsub.publish(&room_id, WsEvent::MessageEdited { message_id, new_content });
+                    }
+
+                    Ok(WsEvent::DeleteMessage { message_id }) => {
+                        let _ = sqlx::query("UPDATE messages SET is_deleted = 1, content = 'This message was deleted', msg_type = 'System' WHERE id = ? AND sender_id = ?")
+                            .bind(&message_id)
+                            .bind(&auth_user_id)
+                            .execute(&state.db).await;
+                        
+                        let room_id = match sqlx::query_scalar::<_, String>("SELECT chat_room_id FROM messages WHERE id = ?").bind(&message_id).fetch_optional(&state.db).await {
+                            Ok(Some(r)) => r,
+                            _ => continue,
+                        };
+                        state.pubsub.publish(&room_id, WsEvent::MessageDeleted { message_id });
+                    }
+
+                    Ok(WsEvent::AddReaction { message_id, emoji }) => {
+                        let _ = sqlx::query("INSERT OR IGNORE INTO message_reactions (message_id, user_id, emoji) VALUES (?, ?, ?)")
+                            .bind(&message_id)
+                            .bind(&auth_user_id)
+                            .bind(&emoji)
+                            .execute(&state.db).await;
+                        
+                        let room_id = match sqlx::query_scalar::<_, String>("SELECT chat_room_id FROM messages WHERE id = ?").bind(&message_id).fetch_optional(&state.db).await {
+                            Ok(Some(r)) => r,
+                            _ => continue,
+                        };
+                        state.pubsub.publish(&room_id, WsEvent::ReactionAdded { message_id, user_id: auth_user_id.clone(), emoji });
+                    }
+
+                    Ok(WsEvent::RemoveReaction { message_id, emoji }) => {
+                        let _ = sqlx::query("DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?")
+                            .bind(&message_id)
+                            .bind(&auth_user_id)
+                            .bind(&emoji)
+                            .execute(&state.db).await;
+                        
+                        let room_id = match sqlx::query_scalar::<_, String>("SELECT chat_room_id FROM messages WHERE id = ?").bind(&message_id).fetch_optional(&state.db).await {
+                            Ok(Some(r)) => r,
+                            _ => continue,
+                        };
+                        state.pubsub.publish(&room_id, WsEvent::ReactionRemoved { message_id, user_id: auth_user_id.clone(), emoji });
+                    }
+
                     Ok(_) => {}
 
                     Err(e) => {
@@ -273,6 +389,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         handle.abort();
     }
     forwarder_handle.abort();
+
+    // Decrement active users and broadcast offline if reaching 0
+    // Decrement active users and broadcast offline if reaching 0
+    {
+        let mut active = state.active_users.write().await;
+        if let Some(count) = active.get_mut(&auth_user_id) {
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    state.pubsub.publish("__global__", WsEvent::PresenceUpdate {
+                        user_id: auth_user_id.clone(),
+                        is_online: false,
+                    });
+
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+                    let _ = sqlx::query("UPDATE users SET last_seen = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(&auth_user_id)
+                        .execute(&state.db)
+                        .await;
+                }
+            }
+        }
+    }
+
     info!("Cleaned up {} room subscriptions for {}", subscribed_rooms.len(), auth_user_name);
 }
 
@@ -288,12 +429,13 @@ async fn get_messages(
     State(state): State<Arc<AppState>>
 ) -> Result<Json<Vec<ChatMessage>>, StatusCode> {
     use sqlx::Row;
+    use std::collections::HashMap;
 
     let limit = params.limit.unwrap_or(50).min(100);
 
     let records = if let Some(before_ts) = params.before {
         sqlx::query(
-            "SELECT id, sender_id, chat_room_id, content, msg_type, timestamp \
+            "SELECT id, sender_id, chat_room_id, content, msg_type, timestamp, reply_to_message_id, is_edited, is_deleted \
              FROM messages WHERE chat_room_id = ? AND timestamp < ? \
              ORDER BY timestamp DESC LIMIT ?"
         )
@@ -305,8 +447,8 @@ async fn get_messages(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
         sqlx::query(
-            "SELECT id, sender_id, chat_room_id, content, msg_type, timestamp \
-             FROM (SELECT id, sender_id, chat_room_id, content, msg_type, timestamp \
+            "SELECT id, sender_id, chat_room_id, content, msg_type, timestamp, reply_to_message_id, is_edited, is_deleted \
+             FROM (SELECT id, sender_id, chat_room_id, content, msg_type, timestamp, reply_to_message_id, is_edited, is_deleted \
                    FROM messages WHERE chat_room_id = ? ORDER BY timestamp DESC LIMIT ?) \
              ORDER BY timestamp ASC"
         )
@@ -317,6 +459,7 @@ async fn get_messages(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
 
+    let mut message_ids: Vec<String> = Vec::new();
     let mut messages: Vec<ChatMessage> = records.iter().map(|rec| {
         let msg_type_str: String = rec.get("msg_type");
         let msg_type = match msg_type_str.as_str() {
@@ -324,15 +467,53 @@ async fn get_messages(
             "System" => models::MessageType::System,
             _ => models::MessageType::Text,
         };
+        let id: String = rec.get("id");
+        message_ids.push(id.clone());
+        
         ChatMessage {
-            id: rec.get("id"),
+            id,
             sender_id: rec.get("sender_id"),
             chat_room_id: rec.get("chat_room_id"),
             content: rec.get("content"),
             msg_type,
             timestamp: rec.get("timestamp"),
+            reply_to_message_id: rec.get("reply_to_message_id"),
+            is_edited: rec.get("is_edited"),
+            is_deleted: rec.get("is_deleted"),
+            reactions: HashMap::new(),
         }
     }).collect();
+
+    // Fetch reactions for these messages
+    if !message_ids.is_empty() {
+        let placeholders = message_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query_str = format!("SELECT message_id, emoji, user_id FROM message_reactions WHERE message_id IN ({})", placeholders);
+        let mut query = sqlx::query(&query_str);
+        for id in &message_ids {
+            query = query.bind(id.clone());
+        }
+        
+        if let Ok(rx_records) = query.fetch_all(&state.db).await {
+            let mut reactions_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+            for rx in rx_records {
+                let msg_id: String = rx.get("message_id");
+                let emoji: String = rx.get("emoji");
+                let user_id: String = rx.get("user_id");
+                
+                reactions_map.entry(msg_id)
+                    .or_default()
+                    .entry(emoji)
+                    .or_default()
+                    .push(user_id);
+            }
+            
+            for msg in &mut messages {
+                if let Some(rx) = reactions_map.remove(&msg.id) {
+                    msg.reactions = rx;
+                }
+            }
+        }
+    }
 
     // Cursor pages come back DESC — reverse to ASC for display
     if params.before.is_some() {
@@ -553,4 +734,12 @@ async fn upload_image(mut multipart: Multipart) -> Result<Json<serde_json::Value
         }
     }
     Err(StatusCode::BAD_REQUEST)
+}
+
+async fn get_online_users(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<String>> {
+    let active = state.active_users.read().await;
+    let online: Vec<String> = active.iter().filter(|(_, &count)| count > 0).map(|(id, _)| id.clone()).collect();
+    Json(online)
 }

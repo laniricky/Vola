@@ -9,6 +9,19 @@ export interface ChatMessage {
   content: string;
   msg_type: MessageType;
   timestamp: number;
+  reply_to_message_id?: string | null;
+  is_edited?: boolean;
+  is_deleted?: boolean;
+  reactions?: Record<string, string[]>; // { emoji: [user_id, ...] }
+}
+
+export interface UserProfile {
+  id: string;
+  username: string;
+  display_name?: string | null;
+  avatar_url?: string | null;
+  bio?: string | null;
+  last_seen?: number | null;
 }
 
 export interface ChatRoom {
@@ -28,9 +41,13 @@ export function useVola() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
   const [readReceipts, setReadReceipts] = useState<Record<string, string>>({}); // user_id -> message_id
+  const [onlineUsers, setOnlineUsers] = useState<Record<string, boolean>>({});
+  const [incomingSignal, setIncomingSignal] = useState<any>(null);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [roomLastMessages, setRoomLastMessages] = useState<Record<string, ChatMessage>>({});
+  
+  const [userProfiles, setUserProfiles] = useState<Record<string, UserProfile>>({});
 
   const [rooms, setRooms] = useState<ChatRoom[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string>('room_1');
@@ -59,9 +76,24 @@ export function useVola() {
     }
   }, []);
 
+  const fetchOnlineUsers = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/users/online`);
+      const data: string[] = await res.json();
+      if (data && Array.isArray(data)) {
+        const map: Record<string, boolean> = {};
+        data.forEach(id => { map[id] = true; });
+        setOnlineUsers(map);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }, []);
+
   useEffect(() => {
     fetchRooms();
-  }, [fetchRooms]); // Run once on mount
+    fetchOnlineUsers();
+  }, [fetchRooms, fetchOnlineUsers]); // Run once on mount
 
   // 2. WebSocket Connection with Exponential Backoff Reconnect
   // Decoupled from activeRoomId — the socket lives independently.
@@ -110,6 +142,36 @@ export function useVola() {
             if (chat_room_id === activeRoomRef.current) {
                 setReadReceipts(prev => ({...prev, [user_id]: message_id}));
             }
+          } else if (data.type === 'PresenceUpdate') {
+             const { user_id, is_online } = data.payload;
+             setOnlineUsers(prev => ({ ...prev, [user_id]: is_online }));
+          } else if (data.type === 'WebRtcSignal') {
+             setIncomingSignal(data.payload);
+          } else if (data.type === 'MessageEdited') {
+             setMessages(prev => prev.map(m => m.id === data.payload.message_id ? { ...m, content: data.payload.new_content, is_edited: true } : m));
+          } else if (data.type === 'MessageDeleted') {
+             setMessages(prev => prev.map(m => m.id === data.payload.message_id ? { ...m, content: 'This message was deleted', is_deleted: true, msg_type: 'System' } : m));
+          } else if (data.type === 'ReactionAdded') {
+             const { message_id, emoji, user_id } = data.payload;
+             setMessages(prev => prev.map(m => {
+               if (m.id !== message_id) return m;
+               const newRx = { ...(m.reactions || {}) };
+               const users = [...(newRx[emoji] || [])];
+               if (!users.includes(user_id)) users.push(user_id);
+               newRx[emoji] = users;
+               return { ...m, reactions: newRx };
+             }));
+          } else if (data.type === 'ReactionRemoved') {
+             const { message_id, emoji, user_id } = data.payload;
+             setMessages(prev => prev.map(m => {
+               if (m.id !== message_id) return m;
+               const newRx = { ...(m.reactions || {}) };
+               if (newRx[emoji]) {
+                 newRx[emoji] = newRx[emoji].filter((id: string) => id !== user_id);
+                 if (newRx[emoji].length === 0) delete newRx[emoji];
+               }
+               return { ...m, reactions: newRx };
+             }));
           }
         } catch (err) {
           console.error('Socket parse error:', err);
@@ -189,7 +251,7 @@ export function useVola() {
     }
   }, [isLoadingMore, hasMoreMessages, messages, activeRoomId]);
 
-  const sendMessage = useCallback((content: string, type: MessageType = 'Text') => {
+  const sendMessage = useCallback((content: string, type: MessageType = 'Text', replyToId?: string) => {
     if (!content.trim() || !ws.current || ws.current.readyState !== WebSocket.OPEN) return;
     const newMsg: ChatMessage = {
       id: Math.random().toString(36).substr(2, 9),
@@ -197,7 +259,8 @@ export function useVola() {
       chat_room_id: activeRoomId,
       content,
       msg_type: type,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      reply_to_message_id: replyToId
     };
     
     sentIds.current.add(newMsg.id);
@@ -208,6 +271,26 @@ export function useVola() {
       payload: newMsg
     }));
   }, [userId, activeRoomId]);
+
+  const editMessage = useCallback((messageId: string, newContent: string) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({ type: 'EditMessage', payload: { message_id: messageId, new_content: newContent } }));
+  }, []);
+
+  const deleteMessage = useCallback((messageId: string) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({ type: 'DeleteMessage', payload: { message_id: messageId } }));
+  }, []);
+
+  const addReaction = useCallback((messageId: string, emoji: string) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({ type: 'AddReaction', payload: { message_id: messageId, emoji } }));
+  }, []);
+
+  const removeReaction = useCallback((messageId: string, emoji: string) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({ type: 'RemoveReaction', payload: { message_id: messageId, emoji } }));
+  }, []);
 
   const emitTyping = useCallback(() => {
      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
@@ -233,6 +316,15 @@ export function useVola() {
           ws.current.send(JSON.stringify({ type: 'MarkRead', payload: { chat_room_id: activeRoomId, message_id: messageId } }));
       }
   }, [activeRoomId]);
+
+  const sendSignal = useCallback((targetUserId: string, payload: any) => {
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+          ws.current.send(JSON.stringify({
+              type: 'WebRtcSignal',
+              payload: { target_user_id: targetUserId, signal_payload: payload }
+          }));
+      }
+  }, []);
 
   const uploadImage = useCallback(async (file: File) => {
     const formData = new FormData();
@@ -289,6 +381,62 @@ export function useVola() {
       }
   }, [token, fetchRooms]);
 
+  const fetchProfile = useCallback(async (targetId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/users/${targetId}`);
+      if (res.ok) {
+        const data: UserProfile = await res.json();
+        setUserProfiles(prev => ({ ...prev, [targetId]: data }));
+      }
+    } catch (e) {
+      console.error("Failed to fetch user profile", e);
+    }
+  }, []);
+
+  const updateProfile = useCallback(async (updates: { display_name?: string, bio?: string }) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/users/me`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(updates)
+      });
+      if (res.ok) {
+        const data: UserProfile = await res.json();
+        setUserProfiles(prev => ({ ...prev, [data.id]: data }));
+      }
+    } catch (e) {
+      console.error("Failed to update profile", e);
+    }
+  }, [token]);
+
+  const uploadAvatar = useCallback(async (fileObj: File) => {
+    if (!token) return;
+    try {
+        const formData = new FormData();
+        formData.append('avatar', fileObj);
+        const res = await fetch(`${API_BASE}/api/users/me/avatar`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}` },
+            body: formData
+        });
+        if (res.ok) {
+           const { avatar_url } = await res.json();
+           if (userId) {
+              setUserProfiles(prev => ({
+                 ...prev,
+                 [userId]: { ...(prev[userId] || {} as UserProfile), avatar_url }
+              }));
+           }
+        }
+    } catch (e) {
+        console.error("Avatar upload failed", e);
+    }
+  }, [token, userId]);
+
   const logout = useCallback(() => {
     localStorage.removeItem('vola_token');
     localStorage.removeItem('vola_user_id');
@@ -312,6 +460,7 @@ export function useVola() {
     setActiveRoomId,
     messages,
     typingUsers,
+    onlineUsers,
     sendMessage,
     emitTyping,
     stopTyping,
@@ -325,5 +474,15 @@ export function useVola() {
     hasMoreMessages,
     isLoadingMore,
     roomLastMessages,
+    incomingSignal,
+    sendSignal,
+    editMessage,
+    deleteMessage,
+    addReaction,
+    removeReaction,
+    userProfiles,
+    fetchProfile,
+    updateProfile,
+    uploadAvatar,
   };
 }

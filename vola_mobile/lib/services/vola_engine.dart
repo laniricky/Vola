@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:async';
 import 'dart:math';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 enum MessageType { Text, ImageBlurHash, System }
 
@@ -18,13 +20,48 @@ class ChatRoom {
   }
 }
 
+// ─── UserProfile ─────────────────────────────────────────────────────────────
+
+class UserProfile {
+  final String id;
+  final String username;
+  final String? displayName;
+  final String? avatarUrl;
+  final String? bio;
+  final int? lastSeen;
+
+  UserProfile({
+    required this.id,
+    required this.username,
+    this.displayName,
+    this.avatarUrl,
+    this.bio,
+    this.lastSeen,
+  });
+
+  factory UserProfile.fromJson(Map<String, dynamic> json) {
+    return UserProfile(
+      id: json['id'],
+      username: json['username'],
+      displayName: json['display_name'],
+      avatarUrl: json['avatar_url'],
+      bio: json['bio'],
+      lastSeen: json['last_seen'],
+    );
+  }
+}
+
 class ChatMessage {
   final String id;
   final String senderId;
   final String chatRoomId;
-  final String content;
-  final MessageType msgType;
+  String content;
+  MessageType msgType;
   final int timestamp;
+  final String? replyToMessageId;
+  bool isEdited;
+  bool isDeleted;
+  Map<String, List<String>> reactions;
 
   ChatMessage({
     required this.id,
@@ -33,9 +70,20 @@ class ChatMessage {
     required this.content,
     required this.msgType,
     required this.timestamp,
-  });
+    this.replyToMessageId,
+    this.isEdited = false,
+    this.isDeleted = false,
+    Map<String, List<String>>? reactions,
+  }) : reactions = reactions ?? {};
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    Map<String, List<String>> parsedReactions = {};
+    if (json['reactions'] != null) {
+      json['reactions'].forEach((k, v) {
+        parsedReactions[k] = List<String>.from(v);
+      });
+    }
+    
     return ChatMessage(
       id: json['id'],
       senderId: json['sender_id'] ?? json['senderId'],
@@ -46,6 +94,10 @@ class ChatMessage {
         orElse: () => MessageType.Text,
       ),
       timestamp: json['timestamp'],
+      replyToMessageId: json['reply_to_message_id'],
+      isEdited: json['is_edited'] ?? false,
+      isDeleted: json['is_deleted'] ?? false,
+      reactions: parsedReactions,
     );
   }
 
@@ -56,6 +108,7 @@ class ChatMessage {
         'content': content,
         'msg_type': msgType.toString().split('.').last,
         'timestamp': timestamp,
+        'reply_to_message_id': replyToMessageId,
       };
 }
 
@@ -74,13 +127,18 @@ class VolaEngine {
   final _authController = StreamController<bool>.broadcast();
   final _readReceiptsController = StreamController<Map<String, String>>.broadcast();
   final _roomLastMessagesController = StreamController<Map<String, ChatMessage>>.broadcast();
+  final _onlineUsersController = StreamController<Map<String, bool>>.broadcast();
+  final _incomingSignalController = StreamController<Map<String, dynamic>>.broadcast();
+  final _userProfilesController = StreamController<Map<String, UserProfile>>.broadcast();
   
   List<ChatMessage> _messages = [];
   List<String> _typingUsers = [];
   List<ChatRoom> _rooms = [];
   Set<String> _sentIds = {};
+  Map<String, bool> _onlineUsers = {};
   Map<String, String> _readReceipts = {}; // userId -> messageId
   Map<String, ChatMessage> _roomLastMessages = {};
+  Map<String, UserProfile> _userProfiles = {};
   String activeRoomId = 'room_1';
   bool hasMoreMessages = false;
   bool isLoadingMore = false;
@@ -95,12 +153,32 @@ class VolaEngine {
   Stream<bool> get authStream => _authController.stream;
   Stream<Map<String, String>> get readReceiptsStream => _readReceiptsController.stream;
   Stream<Map<String, ChatMessage>> get roomLastMessagesStream => _roomLastMessagesController.stream;
+  Stream<Map<String, bool>> get onlineUsersStream => _onlineUsersController.stream;
+  Stream<Map<String, dynamic>> get incomingSignalStream => _incomingSignalController.stream;
+  Stream<Map<String, UserProfile>> get userProfilesStream => _userProfilesController.stream;
   Map<String, String> get readReceipts => Map.unmodifiable(_readReceipts);
+  Map<String, bool> get onlineUsers => Map.unmodifiable(_onlineUsers);
+  Map<String, UserProfile> get userProfiles => Map.unmodifiable(_userProfiles);
 
   Timer? _typingTimer;
 
+  Future<void> _fetchOnlineUsers() async {
+    try {
+      var res = await http.get(Uri.parse('$baseUrl/api/users/online'));
+      if (res.statusCode == 200) {
+        List data = jsonDecode(res.body);
+        _onlineUsers.clear();
+        for (var id in data) _onlineUsers[id] = true;
+        _onlineUsersController.add(_onlineUsers);
+      }
+    } catch (e) {
+      print('Failed to fetch online users: $e');
+    }
+  }
+
   Future<void> initialize() async {
     _fetchRooms();
+    _fetchOnlineUsers();
 
     final prefs = await SharedPreferences.getInstance();
     token = prefs.getString('vola_token');
@@ -329,6 +407,54 @@ class VolaEngine {
             _readReceipts[uId] = messageId;
             _readReceiptsController.add(_readReceipts);
           }
+        } else if (data['type'] == 'PresenceUpdate') {
+          final payload = data['payload'];
+          final String uId = payload['user_id'];
+          final bool isOnline = payload['is_online'];
+          _onlineUsers[uId] = isOnline;
+          _onlineUsersController.add(_onlineUsers);
+        } else if (data['type'] == 'WebRtcSignal') {
+          _incomingSignalController.add(data['payload'] as Map<String, dynamic>);
+        } else if (data['type'] == 'MessageEdited') {
+          final payload = data['payload'];
+          final index = _messages.indexWhere((m) => m.id == payload['message_id']);
+          if (index != -1) {
+             _messages[index].content = payload['new_content'];
+             _messages[index].isEdited = true;
+             _messagesController.add(List.from(_messages));
+          }
+        } else if (data['type'] == 'MessageDeleted') {
+          final payload = data['payload'];
+          final index = _messages.indexWhere((m) => m.id == payload['message_id']);
+          if (index != -1) {
+             _messages[index].content = 'This message was deleted';
+             _messages[index].isDeleted = true;
+             _messages[index].msgType = MessageType.System;
+             _messagesController.add(List.from(_messages));
+          }
+        } else if (data['type'] == 'ReactionAdded') {
+          final payload = data['payload'];
+          final index = _messages.indexWhere((m) => m.id == payload['message_id']);
+          if (index != -1) {
+             final emoji = payload['emoji'];
+             final uId = payload['user_id'];
+             if (!(_messages[index].reactions[emoji]?.contains(uId) ?? false)) {
+               _messages[index].reactions.putIfAbsent(emoji, () => []).add(uId);
+               _messagesController.add(List.from(_messages));
+             }
+          }
+        } else if (data['type'] == 'ReactionRemoved') {
+          final payload = data['payload'];
+          final index = _messages.indexWhere((m) => m.id == payload['message_id']);
+          if (index != -1) {
+             final emoji = payload['emoji'];
+             final uId = payload['user_id'];
+             _messages[index].reactions[emoji]?.remove(uId);
+             if (_messages[index].reactions[emoji]?.isEmpty == true) {
+               _messages[index].reactions.remove(emoji);
+             }
+             _messagesController.add(List.from(_messages));
+          }
         }
       }, onDone: () {
         if (_intentionalClose) {
@@ -361,7 +487,7 @@ class VolaEngine {
     }
   }
 
-  void sendMessage(String content, [MessageType type = MessageType.Text]) {
+  void sendMessage(String content, [MessageType type = MessageType.Text, String? replyToId]) {
     if (content.trim().isEmpty || _channel == null) return;
     
     final newMsg = ChatMessage(
@@ -371,16 +497,33 @@ class VolaEngine {
         content: content,
         msgType: type,
         timestamp: DateTime.now().millisecondsSinceEpoch,
+        replyToMessageId: replyToId,
     );
 
     _sentIds.add(newMsg.id);
     _messages.add(newMsg);
-    _messagesController.add(_messages);
+    _messagesController.add(List.from(_messages));
 
     _channel!.sink.add(jsonEncode({
       "type": "PublishMessage",
       "payload": newMsg.toJson(),
     }));
+  }
+
+  void editMessage(String messageId, String newContent) {
+    _channel?.sink.add(jsonEncode({"type": "EditMessage", "payload": {"message_id": messageId, "new_content": newContent}}));
+  }
+
+  void deleteMessage(String messageId) {
+    _channel?.sink.add(jsonEncode({"type": "DeleteMessage", "payload": {"message_id": messageId}}));
+  }
+
+  void addReaction(String messageId, String emoji) {
+    _channel?.sink.add(jsonEncode({"type": "AddReaction", "payload": {"message_id": messageId, "emoji": emoji}}));
+  }
+
+  void removeReaction(String messageId, String emoji) {
+    _channel?.sink.add(jsonEncode({"type": "RemoveReaction", "payload": {"message_id": messageId, "emoji": emoji}}));
   }
 
   Future<void> uploadImage(String filePath) async {
@@ -434,6 +577,93 @@ class VolaEngine {
     }
   }
 
+  void sendSignal(String targetUserId, Map<String, dynamic> payload) {
+    if (_channel == null) return;
+    _channel!.sink.add(jsonEncode({
+      'type': 'WebRtcSignal',
+      'payload': {
+        'target_user_id': targetUserId,
+        'signal_payload': payload,
+      },
+    }));
+  }
+
+  // ─── Profile API Methods ────────────────────────────────────────────────────
+
+  Future<void> fetchProfile(String targetId) async {
+    try {
+      final res = await http.get(Uri.parse('$baseUrl/api/users/$targetId'));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final profile = UserProfile.fromJson(data);
+        _userProfiles[targetId] = profile;
+        _userProfilesController.add(_userProfiles);
+      }
+    } catch (e) {
+      print('Failed to fetch profile: $e');
+    }
+  }
+
+  Future<void> updateProfile({String? displayName, String? bio}) async {
+    if (token == null) return;
+    try {
+      final body = <String, dynamic>{};
+      if (displayName != null) body['display_name'] = displayName;
+      if (bio != null) body['bio'] = bio;
+
+      final res = await http.patch(
+        Uri.parse('$baseUrl/api/users/me'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $token',
+        },
+        body: jsonEncode(body),
+      );
+      if (res.statusCode == 200 && userId != null) {
+        final data = jsonDecode(res.body);
+        _userProfiles[userId!] = UserProfile.fromJson(data);
+        _userProfilesController.add(_userProfiles);
+      }
+    } catch (e) {
+      print('Failed to update profile: $e');
+    }
+  }
+
+  Future<void> uploadAvatar(File imageFile) async {
+    if (token == null || userId == null) return;
+    try {
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse('$baseUrl/api/users/me/avatar'),
+      );
+      request.headers['Authorization'] = 'Bearer $token';
+      request.files.add(await http.MultipartFile.fromPath('avatar', imageFile.path));
+
+      final streamed = await request.send();
+      if (streamed.statusCode == 200) {
+        final body = await streamed.stream.bytesToString();
+        final data = jsonDecode(body);
+        final avatarUrl = data['avatar_url'] as String?;
+        if (avatarUrl != null) {
+          // Rewrite for emulator
+          final fixedUrl = avatarUrl.replaceAll('127.0.0.1', '10.0.2.2');
+          final existing = _userProfiles[userId!];
+          _userProfiles[userId!] = UserProfile(
+            id: userId!,
+            username: existing?.username ?? '',
+            displayName: existing?.displayName,
+            avatarUrl: fixedUrl,
+            bio: existing?.bio,
+            lastSeen: existing?.lastSeen,
+          );
+          _userProfilesController.add(_userProfiles);
+        }
+      }
+    } catch (e) {
+      print('Failed to upload avatar: $e');
+    }
+  }
+
   void dispose() {
     _intentionalClose = true;
     _channel?.sink.close();
@@ -444,5 +674,8 @@ class VolaEngine {
     _authController.close();
     _readReceiptsController.close();
     _roomLastMessagesController.close();
+    _onlineUsersController.close();
+    _incomingSignalController.close();
+    _userProfilesController.close();
   }
 }
