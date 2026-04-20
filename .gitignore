@@ -28,3 +28,11 @@ vola_mobile/ios/Pods/
 vola_mobile/macos/Flutter/ephemeral/
 flutter-sdk/
 flutter/
+
+# Android Native
+vola_android/.gradle/
+vola_android/build/
+vola_android/app/build/
+vola_android/local.properties
+vola_android/.idea/
+vola_android/**/*.iml
